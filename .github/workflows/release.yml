@@ -42,7 +42,7 @@ jobs:
         id: meta
         run: |
           echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          # Owner segment of the Docker Hub namespace (e.g. "concil859856")
+          # Owner segment of the Docker Hub namespace (e.g. "vocence")
           # comes from the org secret so we don't hard-code the username.
           echo "image=${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
