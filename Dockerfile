@@ -50,6 +50,14 @@ COPY samples/ ./samples/
 # are already pinned above; we don't want pip to re-resolve them.
 RUN pip install --no-deps -e .
 
+# Build-time import smoke test — verifies the full import chain the
+# entrypoint exercises (torch + faster-qwen3-tts + qwen_tts + this
+# package) is internally consistent. Cheap (no GPU, no model load,
+# ~5 s) but catches torch ABI mismatches and missing modules BEFORE
+# the image reaches Docker Hub. Runs on the CPU-only GHA runner.
+RUN python3 -c "import torch; print('torch', torch.__version__)" \
+    && python3 -c "from qwen3_tts_streaming.server import main; print('server import OK')"
+
 # Cache mount point for HuggingFace model weights. Recommend mounting a
 # persistent volume here so model download (~3.4 GB) only happens once per box.
 VOLUME /cache/hf
