@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import collections
 import hashlib
 import io
 import json
@@ -194,6 +195,72 @@ class _InflightTracker:
 
 class _ServerBusy(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Metrics — exposed via GET /metrics for the Vocence ops dashboard to scrape.
+# Monotonic counters (backend computes per-minute deltas) plus a sliding-window
+# duration percentile sample. All thread-safe; updated from the WS handler
+# (asyncio thread) and read from the metrics endpoint.
+# ---------------------------------------------------------------------------
+
+class _Metrics:
+    def __init__(self, recent_window: int = 1000) -> None:
+        self._lock = threading.Lock()
+        self.start_ts = time.time()
+        self.requests_total = 0
+        self.requests_ok = 0
+        self.requests_err: dict[str, int] = {}
+        self.duration_ms_sum = 0.0
+        self.duration_ms_count = 0
+        self.recent_durations_ms: collections.deque[float] = collections.deque(maxlen=recent_window)
+        self.bytes_sent_total = 0
+        self.audio_ms_total = 0  # total synthesized audio length (informational)
+
+    def record_success(self, duration_ms: float, *, bytes_sent: int = 0, audio_ms: int = 0) -> None:
+        with self._lock:
+            self.requests_total += 1
+            self.requests_ok += 1
+            self.duration_ms_sum += duration_ms
+            self.duration_ms_count += 1
+            self.recent_durations_ms.append(duration_ms)
+            self.bytes_sent_total += bytes_sent
+            self.audio_ms_total += audio_ms
+
+    def record_error(self, code: str, duration_ms: float = 0.0) -> None:
+        with self._lock:
+            self.requests_total += 1
+            self.requests_err[code] = self.requests_err.get(code, 0) + 1
+            if duration_ms > 0:
+                self.duration_ms_sum += duration_ms
+                self.duration_ms_count += 1
+                self.recent_durations_ms.append(duration_ms)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            durations = sorted(self.recent_durations_ms)
+            n = len(durations)
+
+            def pct(p: float) -> float:
+                if n == 0:
+                    return 0.0
+                idx = min(n - 1, int(p * n))
+                return durations[idx]
+
+            return {
+                "uptime_seconds": int(time.time() - self.start_ts),
+                "requests_total": self.requests_total,
+                "requests_ok": self.requests_ok,
+                "requests_err": dict(self.requests_err),
+                "duration_ms_sum": self.duration_ms_sum,
+                "duration_ms_count": self.duration_ms_count,
+                "duration_ms_avg": (self.duration_ms_sum / self.duration_ms_count) if self.duration_ms_count else 0.0,
+                "duration_ms_p50": pct(0.50),
+                "duration_ms_p95": pct(0.95),
+                "duration_ms_p99": pct(0.99),
+                "bytes_sent_total": self.bytes_sent_total,
+                "audio_ms_total": self.audio_ms_total,
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -488,10 +555,12 @@ class StreamingServer:
         self._inflight = _InflightTracker(cap=cap)
         self._gpu_lock = threading.Lock()
         self._ref_cache = _RefAudioCache(REF_CACHE_SIZE)
+        self._metrics = _Metrics()
 
     async def healthz(self, _request: web.Request) -> web.Response:
         return web.json_response({
             "status": "ok",
+            "service": "tts_streaming",
             "model_id": self._model_id,
             "sample_rate": SAMPLE_RATE,
             "frame_ms": FRAME_MS,
@@ -499,6 +568,23 @@ class StreamingServer:
             "cap": self._inflight.cap,
             "dev_stub": False,
         })
+
+    async def metrics(self, request: web.Request) -> web.Response:
+        """Scrape endpoint for the Vocence ops dashboard. Bearer-auth'd the
+        same as /v1/voice-clone/stream so a public-IP rented box doesn't leak
+        traffic counters to anyone who curls it."""
+        if self._api_key:
+            header = request.headers.get("Authorization", "")
+            if header != f"Bearer {self._api_key}":
+                return web.json_response(
+                    {"type": "error", "code": "auth", "message": "missing or invalid bearer token"},
+                    status=401,
+                )
+        snap = self._metrics.snapshot()
+        snap["service"] = "tts_streaming"
+        snap["inflight"] = self._inflight.inflight
+        snap["cap"] = self._inflight.cap
+        return web.json_response(snap)
 
     async def voice_clone_stream(self, request: web.Request) -> web.WebSocketResponse:
         # Auth before WS upgrade so we can return a clean 401.
@@ -530,19 +616,27 @@ class StreamingServer:
         return ws
 
     async def _handle_session(self, ws: web.WebSocketResponse) -> None:
+        t_session = time.perf_counter()  # for metrics; covers handshake -> end
+
+        def session_ms() -> float:
+            return (time.perf_counter() - t_session) * 1000.0
+
         # 1. Read the `start` frame with an idle timeout.
         try:
             first = await asyncio.wait_for(ws.receive(), timeout=IDLE_START_TIMEOUT_S)
         except asyncio.TimeoutError:
             await _send_error(ws, "timeout", f"no start frame within {IDLE_START_TIMEOUT_S}s")
             await ws.close(code=WSCloseCode.GOING_AWAY)
+            self._metrics.record_error("timeout", session_ms())
             return
 
         if first.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+            # Client gave up before sending start; not an error from our side.
             return
         if first.type != WSMsgType.TEXT:
             await _send_error(ws, "bad_request", "start frame must be a text JSON message")
             await ws.close(code=WSCloseCode.POLICY_VIOLATION)
+            self._metrics.record_error("bad_request", session_ms())
             return
 
         try:
@@ -553,10 +647,12 @@ class StreamingServer:
                 "ref_audio_sha256 not in server cache — resend with ref_audio_b64",
             )
             await ws.close(code=WSCloseCode.POLICY_VIOLATION)
+            self._metrics.record_error("ref_not_cached", session_ms())
             return
         except _BadRequest as e:
             await _send_error(ws, "bad_request", e.message)
             await ws.close(code=WSCloseCode.POLICY_VIOLATION)
+            self._metrics.record_error("bad_request", session_ms())
             return
 
         # 2. Meta. Fixed by spec — the backend ignores values but other clients may use them.
@@ -569,6 +665,9 @@ class StreamingServer:
                 "channels": 1,
             })
         except Exception:
+            # Client disconnected before we could send meta — count as bad_request
+            # (we accepted the slot and parsed; not a clean cancellation).
+            self._metrics.record_error("client_disconnect", session_ms())
             return
 
         # 3. Spin up the synthesis thread.
@@ -591,6 +690,8 @@ class StreamingServer:
         runner.start()
         ended_cleanly = False
         synth_error: str | None = None
+        bytes_sent = 0
+        cancelled_by_client = False
 
         try:
             while True:
@@ -602,6 +703,7 @@ class StreamingServer:
                     break
 
                 if item is runner._CANCELLED:
+                    cancelled_by_client = True
                     return
                 if item is runner._DONE:
                     if runner.error is not None:
@@ -612,12 +714,15 @@ class StreamingServer:
 
                 try:
                     await ws.send_bytes(item)
+                    bytes_sent += len(item)
                 except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
                     runner.cancel_event.set()
+                    cancelled_by_client = True
                     return
                 except Exception as e:
                     runner.cancel_event.set()
                     _log.warning("WS send_bytes failed: %s", e)
+                    cancelled_by_client = True
                     return
 
             if ended_cleanly:
@@ -630,9 +735,18 @@ class StreamingServer:
                     "voice-clone-stream: ok text=%d chars audio=%dms wall=%.2fs",
                     len(text), duration_ms, time.perf_counter() - t_start,
                 )
+                self._metrics.record_success(
+                    session_ms(), bytes_sent=bytes_sent, audio_ms=duration_ms,
+                )
             else:
                 await _send_error(ws, "engine_failed", (synth_error or "unknown engine error"))
+                code = "timeout" if synth_error and "hard cap" in synth_error else "engine_failed"
+                self._metrics.record_error(code, session_ms())
         finally:
+            # Client barge-in is NOT an error — it's normal voice-agent flow.
+            # We don't record it as success either (no `end` sent); intentionally
+            # untracked so error rates stay clean.
+            _ = cancelled_by_client and not ended_cleanly  # noqa: keeps intent visible
             runner.cancel_event.set()
             close_watcher.cancel()
             try:
@@ -724,6 +838,7 @@ def build_app(
     )
     app = web.Application()
     app.router.add_get("/healthz", server.healthz)
+    app.router.add_get("/metrics", server.metrics)
     app.router.add_get("/v1/voice-clone/stream", server.voice_clone_stream)
     app["server"] = server
     return app
