@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qwen3_tts_streaming*"]
+
+# Ship the bundled warmup ref audio so an editable install can find it via
+# the relative path computed in server.py.
+[tool.setuptools.package-data]
+qwen3_tts_streaming = ["../samples/*.wav", "../samples/*.txt"]
+
+[project]
+name = "qwen3-tts-streaming"
+version = "0.1.0"
+description = "Voice-clone streaming WebSocket server for faster-qwen3-tts (drop-in for the Vocence dashboard-backend TTS spec)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Vocence" }]
+keywords = ["tts", "qwen3", "websocket", "streaming", "voice-clone"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+# Versions pinned to match faster-qwen3-tts/pyproject.toml so a single
+# environment can install both without resolver conflicts.
+dependencies = [
+    "faster-qwen3-tts>=0.2.6",
+    "qwen-tts>=0.1.1",
+    "transformers>=4.57",
+    "torch>=2.5.1",
+    "numpy",
+    "soundfile",
+    "huggingface-hub",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+qwen3-tts-streaming = "qwen3_tts_streaming.server:main"
+
+[project.urls]
+"TTS Server Spec" = "https://github.com/vocence/vocence_website/blob/main/dashboard-backend/docs/tts_server_spec.md"
