@@ -1,0 +1,69 @@
+name: Build & Push Image
+# Triggers ONLY on commits landing on main (which happens when a PR is
+# merged). Push to feature branches / direct dev work does NOT publish.
+# This is the "main = production" pattern — same as Vapi, ElevenLabs,
+# every well-run service repo.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+      - "samples/*.txt"
+  # Manual re-run from the Actions tab is sometimes useful (e.g. registry
+  # outage during the original push). No other triggers — feature-branch
+  # pushes intentionally do nothing.
+  workflow_dispatch: {}
+
+env:
+  IMAGE_NAME: fast-tts-streaming
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute short SHA
+        id: meta
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          # Owner segment of the Docker Hub namespace (e.g. "concil859856")
+          # comes from the org secret so we don't hard-code the username.
+          echo "image=${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.sha_short }}
+          # Cache layers across builds so subsequent merges reuse the
+          # apt + torch + faster-qwen3-tts layers (the slow ones).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "### Pushed image" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ steps.meta.outputs.image }}:latest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.sha_short }}\`" >> "$GITHUB_STEP_SUMMARY"
