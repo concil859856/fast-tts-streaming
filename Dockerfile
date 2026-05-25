@@ -46,9 +46,10 @@ COPY pyproject.toml ./
 COPY qwen3_tts_streaming/ ./qwen3_tts_streaming/
 COPY samples/ ./samples/
 
-# Install the service itself. --no-deps because torch + faster-qwen3-tts
-# are already pinned above; we don't want pip to re-resolve them.
-RUN pip install --no-deps -e .
+# Install the service and its deps. Constraint file pins the torch versions
+# already installed from the cu128 index so pip doesn't re-resolve them.
+RUN pip freeze | grep -iE '^(torch|torchaudio|torchvision)' > /tmp/torch-pin.txt \
+    && pip install -e . -c /tmp/torch-pin.txt
 
 # Build-time import smoke test — verifies the full import chain the
 # entrypoint exercises (torch + faster-qwen3-tts + qwen_tts + this
