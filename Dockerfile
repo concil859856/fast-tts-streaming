@@ -17,9 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # HF cache path so we can mount a volume to skip re-download across pulls
     HF_HOME=/cache/hf \
-    TRANSFORMERS_CACHE=/cache/hf/transformers \
     QWEN3_TTS_HOST=0.0.0.0 \
     QWEN3_TTS_PORT=8111
 
